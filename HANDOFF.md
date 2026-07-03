@@ -99,10 +99,9 @@ curl -s -X POST https://lawbey-mcp.fly.dev/debug/query \
 - **Determinism:** `temperature=0`, so the answer is deterministic for a given
   retrieval. Identical queries may differ slightly across calls because
   retrieval varies upstream.
-- **Scope:** the CARTA knowledge base (`cda0f2ba-…`, named `CARTA mcp-test`)
-  currently contains the **Smuggling of Migrants Act 2025** only. More statutes
-  can be added to the same KB on the Railway OpenWebUI instance with **no MCP
-  code change** — the server is scoped to that KB by id.
+- **Scope:** the CARTA knowledge base currently contains the **Smuggling of
+  Migrants Act 2025** only. More statutes can be added to the same knowledge
+  base with **no MCP code change** — the server is scoped to that KB.
 - **Rate limits:** 100 / hour and 1000 / day per partner key (in-memory; resets
   on redeploy).
 
@@ -111,7 +110,7 @@ curl -s -X POST https://lawbey-mcp.fly.dev/debug/query \
 ## 5. Security notes for Carta
 
 - Send the partner key only via the `Authorization` header. Never in URLs.
-- The upstream LawBey OpenWebUI API key is held server-side only and is never
+- The upstream LawBey API key is held server-side only and is never
   returned to callers.
 - `context` is optional and must not contain PII — it is forwarded to the
   upstream model.
