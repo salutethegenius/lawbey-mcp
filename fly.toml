@@ -1,0 +1,28 @@
+# Fly.io config for lawbey-mcp.
+# Secrets (OPENWEBUI_API_KEY, PARTNER_API_KEYS) are set via `fly secrets set`,
+# NOT stored in this file.
+
+app = "lawbey-mcp"
+primary_region = "mia"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = false
+  min_machines_running = 1
+
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "10s"
+  method = "GET"
+  path = "/health"
+
+[vm]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
