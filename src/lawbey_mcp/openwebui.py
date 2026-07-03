@@ -35,6 +35,11 @@ class OpenWebUIClient:
         self._settings = settings
         self._base = settings.openwebui_base_url
         self._timeout = timeout
+        # Cached display name of the scoped knowledge base. Open WebUI's chat
+        # completions `sources[].source` only carries {type, id} (no name), so
+        # we resolve the KB name once and inject it into each source's
+        # `collection` field to satisfy the response contract.
+        self._kb_name: Optional[str] = None
 
     def _headers(self) -> Dict[str, str]:
         return {
@@ -62,12 +67,38 @@ class OpenWebUIClient:
             return data["data"]
         return data if isinstance(data, list) else []
 
+    async def _resolve_kb_name(self) -> str:
+        """Fetch and cache the display name of the scoped knowledge base.
+
+        Falls back to the KB id if the lookup fails, so the response contract
+        always carries a non-empty `collection` label.
+        """
+        if self._kb_name is not None:
+            return self._kb_name
+        kb_id = self._settings.openwebui_kb_id
+        name = kb_id
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await client.get(
+                    f"{self._base}/api/v1/knowledge/{kb_id}",
+                    headers=self._headers(),
+                )
+            if resp.status_code < 400:
+                data = resp.json()
+                if isinstance(data, dict) and data.get("name"):
+                    name = data["name"]
+        except Exception as e:
+            logger.warning("KB name lookup failed (using id as fallback): %s", e)
+        self._kb_name = name
+        return name
+
     async def chat_completion(
         self,
         query: str,
         context: Optional[str] = None,
         use_rag: bool = True,
         system: Optional[str] = None,
+        temperature: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Call POST /api/chat/completions scoped to the CARTA knowledge base.
 
@@ -83,6 +114,8 @@ class OpenWebUIClient:
             "model": self._settings.openwebui_model_id,
             "messages": messages,
         }
+        if temperature is not None:
+            payload["temperature"] = temperature
         if use_rag:
             payload["files"] = [
                 {"type": "collection", "id": self._settings.openwebui_kb_id}
@@ -133,6 +166,12 @@ class OpenWebUIClient:
             data = resp.json()
             answer = _extract_answer(data)
             sources = _extract_sources(data)
+            # Open WebUI omits the collection name from `sources[].source`; fill
+            # it in from the (cached) KB display name for our scoped collection.
+            kb_name = await self._resolve_kb_name()
+            for s in sources:
+                if not s.get("collection"):
+                    s["collection"] = kb_name
             return {"answer": answer, "sources": sources, "raw": data}
 
         # Should be unreachable, but keep a safe fallback.

@@ -118,13 +118,43 @@ async def run_legal_query(
     # context does not contain..."). Open WebUI's default behavior already
     # produces well-cited answers and naturally declines off-topic questions
     # (e.g. US corporate tax) when the retrieved context is irrelevant.
-    try:
-        result = await client.chat_completion(
-            query=query, context=context, use_rag=use_rag, system=None
+    #
+    # Upstream RAG retrieval is non-deterministic/bimodal: a given request may
+    # retrieve the relevant chunks OR unrelated ones. When it retrieves the
+    # wrong chunks the model declines ("context does not contain..."). We retry
+    # on such declines (independent retrieval each attempt) so a grounded
+    # answer is almost always returned. temperature=0 makes the answer for a
+    # given retrieval deterministic.
+    max_attempts = max(1, settings.rag_max_attempts)
+    result: Dict[str, Any] = {}
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = await client.chat_completion(
+                query=query,
+                context=context,
+                use_rag=use_rag,
+                system=None,
+                temperature=settings.openwebui_temperature,
+            )
+        except OpenWebUIError as e:
+            logger.error("Upstream error: kind=%s status=%s msg=%s", e.kind, e.status, e.message)
+            return _error(e.kind, e.message)
+
+        answer = result["answer"]
+        sources = result["sources"]
+        is_decline = bool(_DECLINE_RE.search(answer))
+
+        # Only retry when RAG is on AND the model declined (wrong chunks
+        # retrieved). Off-topic / non-RAG / real answers are returned as-is.
+        if not is_decline or not use_rag or attempt >= max_attempts:
+            break
+        logger.info(
+            "RAG decline on attempt %d/%d — retrying (upstream retrieval "
+            "non-determinism)",
+            attempt,
+            max_attempts,
         )
-    except OpenWebUIError as e:
-        logger.error("Upstream error: kind=%s status=%s msg=%s", e.kind, e.status, e.message)
-        return _error(e.kind, e.message)
+        last_result = result
 
     answer: str = result["answer"]
     sources: List[Dict[str, Any]] = result["sources"]

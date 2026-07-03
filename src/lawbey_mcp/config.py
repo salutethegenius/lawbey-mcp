@@ -30,6 +30,16 @@ class Settings(BaseSettings):
     openwebui_model_id: str = "gpt-4o-mini-2024-07-18"
     openwebui_kb_id: str = "cda0f2ba-88d1-4c73-8a58-50d14180ba98"
 
+    # Sampling temperature sent to Open WebUI. 0.0 = deterministic answers for a
+    # given retrieval (the retrieval itself is non-deterministic; see retries).
+    openwebui_temperature: float = 0.0
+
+    # RAG retrieval on the upstream instance is bimodal/non-deterministic
+    # (some requests retrieve the relevant chunks, others retrieve unrelated
+    # ones). Retry on a decline up to this many total attempts so a grounded
+    # answer is almost always returned. P(grounded) = 1 - (1-p)^n.
+    rag_max_attempts: int = 3
+
     # Partner authentication. Format: "name:secret,name:secret".
     partner_api_keys: str = ""
 
