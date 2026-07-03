@@ -1,9 +1,11 @@
 # Fly.io config for lawbey-mcp.
-# Secrets (OPENWEBUI_API_KEY, PARTNER_API_KEYS) are set via `fly secrets set`,
-# NOT stored in this file.
+# Region: iad (Ashburn, VA). The brief requested Miami (mia), but Fly has
+# deprecated mia for new resources; iad is the closest US-east substitute for
+# Bahamas-bound traffic. Secrets (OPENWEBUI_API_KEY, PARTNER_API_KEYS) are set
+# via `fly secrets set`, NOT stored in this file.
 
 app = "lawbey-mcp"
-primary_region = "mia"
+primary_region = "iad"
 
 [build]
   dockerfile = "Dockerfile"
