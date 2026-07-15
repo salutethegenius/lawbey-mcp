@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -40,6 +41,14 @@ class OpenWebUIClient:
         # we resolve the KB name once and inject it into each source's
         # `collection` field to satisfy the response contract.
         self._kb_name: Optional[str] = None
+        # File IDs in the scoped KB, refreshed on a short TTL so newly ingested
+        # files are picked up without a server restart. Open WebUI v0.6.34
+        # collection-level retrieval does not reliably search all files in a
+        # collection when many files are attached. Querying individual file IDs
+        # instead works correctly, so we fetch the KB's file_ids and pass them
+        # as per-file references in the chat completions payload.
+        self._kb_file_ids: Optional[List[str]] = None
+        self._kb_file_ids_fetched_at: float = 0.0
 
     def _headers(self) -> Dict[str, str]:
         return {
@@ -92,6 +101,35 @@ class OpenWebUIClient:
         self._kb_name = name
         return name
 
+    async def _get_kb_file_ids(self) -> List[str]:
+        """Fetch (with short TTL cache) the file IDs in the scoped knowledge base.
+
+        Open WebUI v0.6.34 collection-level retrieval does not reliably search
+        all files when many are attached to a single KB. Querying individual
+        file IDs works correctly, so we resolve the list and pass each as a
+        per-file reference in the chat completions payload. The list is cached
+        for 60 seconds so newly ingested files are picked up without a restart.
+        """
+        if self._kb_file_ids is not None and (time.monotonic() - self._kb_file_ids_fetched_at) < 60:
+            return self._kb_file_ids
+        kb_id = self._settings.openwebui_kb_id
+        file_ids: List[str] = []
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await client.get(
+                    f"{self._base}/api/v1/knowledge/{kb_id}",
+                    headers=self._headers(),
+                )
+            if resp.status_code < 400:
+                data = resp.json()
+                if isinstance(data, dict):
+                    file_ids = data.get("data", {}).get("file_ids", []) or []
+        except Exception as e:
+            logger.warning("KB file_ids lookup failed: %s", e)
+        self._kb_file_ids = file_ids
+        self._kb_file_ids_fetched_at = time.monotonic()
+        return file_ids
+
     async def chat_completion(
         self,
         query: str,
@@ -117,9 +155,15 @@ class OpenWebUIClient:
         if temperature is not None:
             payload["temperature"] = temperature
         if use_rag:
-            payload["files"] = [
-                {"type": "collection", "id": self._settings.openwebui_kb_id}
-            ]
+            file_ids = await self._get_kb_file_ids()
+            if file_ids:
+                payload["files"] = [
+                    {"type": "file", "id": fid} for fid in file_ids
+                ]
+            else:
+                payload["files"] = [
+                    {"type": "collection", "id": self._settings.openwebui_kb_id}
+                ]
 
         last_exc: Optional[OpenWebUIError] = None
         for attempt in (1, 2):

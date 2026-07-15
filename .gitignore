@@ -22,3 +22,7 @@ __pycache__/
 
 # Fly.io — fly.toml is non-secret config and SHOULD be committed.
 # Secrets are set via `fly secrets set`, never stored in fly.toml.
+
+# Acts — downloaded source PDFs and processed ingestion artifacts
+# (168MB of binaries + OCR output; not needed in the repo)
+acts/
