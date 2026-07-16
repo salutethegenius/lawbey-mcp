@@ -9,14 +9,161 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
 from .config import Settings
 
 logger = logging.getLogger("lawbey_mcp.openwebui")
+
+# Cap on how many file IDs we pass into chat completions after a collection
+# pre-query. Enough for grounded multi-doc answers; low enough to avoid the
+# per-file hybrid-search hang that appears once dozens of files are attached.
+_RAG_FILE_CAP = 12
+
+# Legal / regulatory acronyms common in the CARTA KB. Expanded forms are
+# appended to retrieval queries so MiniLM (and stronger embedders) can match
+# statute filenames and body text that spell the term out.
+_ACRONYM_EXPANSIONS: Dict[str, str] = {
+    "IBC": "International Business Company",
+    "IBCs": "International Business Companies",
+    "DARE": "Digital Assets and Registered Exchanges",
+    "AML": "anti-money laundering",
+    "CFT": "countering the financing of terrorism",
+    "BTCRA": "Banks and Trust Companies Regulation Act",
+    "BTCR": "Banks and Trust Companies Regulation",
+    "FCSP": "Financial and Corporate Service Providers",
+    "FTRA": "Financial Transactions Reporting Act",
+    "SIA": "Securities Industry Act",
+    "CESRA": "Commercial Entities Substance Requirements",
+    "IFA": "Investment Funds Act",
+    "AIFM": "alternative investment fund manager",
+    "SMART": "SMART fund",
+}
+
+_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "and",
+        "or",
+        "of",
+        "in",
+        "on",
+        "for",
+        "to",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "what",
+        "which",
+        "who",
+        "whom",
+        "how",
+        "when",
+        "where",
+        "why",
+        "does",
+        "do",
+        "did",
+        "can",
+        "could",
+        "should",
+        "would",
+        "may",
+        "might",
+        "must",
+        "with",
+        "from",
+        "into",
+        "about",
+        "under",
+        "over",
+        "between",
+        "through",
+        "during",
+        "before",
+        "after",
+        "above",
+        "below",
+        "this",
+        "that",
+        "these",
+        "those",
+        "it",
+        "its",
+        "as",
+        "at",
+        "by",
+        "please",
+        "tell",
+        "me",
+        "explain",
+        "describe",
+        "bahamas",
+        "bahamian",
+        "law",
+        "laws",
+        "act",
+        "acts",
+        "section",
+        "sections",
+    }
+)
+
+
+def _retrieval_queries(query: str) -> List[str]:
+    """Build complementary retrieval strings for one user question.
+
+    MiniLM ranks short keyword queries far better than long natural-language
+    questions over a large multi-act KB. We therefore search with:
+      1. the original question (preserves phrasing),
+      2. the question with known acronyms expanded,
+      3. a keyword-only distill (tokens + expansions, stopwords stripped).
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    out: List[str] = [q]
+
+    # Acronym expansion: replace whole-word acronyms (case-insensitive).
+    expanded = q
+    for acr, full in _ACRONYM_EXPANSIONS.items():
+        expanded = re.sub(rf"\b{re.escape(acr)}\b", f"{acr} {full}", expanded, flags=re.IGNORECASE)
+    if expanded.lower() != q.lower():
+        out.append(expanded)
+
+    # Keyword distill: keep content tokens + any matched expansions.
+    tokens = re.findall(r"[A-Za-z0-9§]+", q)
+    keywords: List[str] = []
+    seen_kw: set[str] = set()
+    for tok in tokens:
+        low = tok.lower()
+        if low in _STOPWORDS or len(tok) < 2:
+            continue
+        if low not in seen_kw:
+            seen_kw.add(low)
+            keywords.append(tok)
+        upper = tok.upper()
+        if upper in _ACRONYM_EXPANSIONS:
+            full = _ACRONYM_EXPANSIONS[upper]
+            if full.lower() not in seen_kw:
+                seen_kw.add(full.lower())
+                keywords.append(full)
+    if keywords:
+        kw_query = " ".join(keywords)
+        if kw_query.lower() not in {s.lower() for s in out}:
+            out.append(kw_query)
+
+    return out
 
 
 class OpenWebUIError(Exception):
@@ -41,14 +188,6 @@ class OpenWebUIClient:
         # we resolve the KB name once and inject it into each source's
         # `collection` field to satisfy the response contract.
         self._kb_name: Optional[str] = None
-        # File IDs in the scoped KB, refreshed on a short TTL so newly ingested
-        # files are picked up without a server restart. Open WebUI v0.6.34
-        # collection-level retrieval does not reliably search all files in a
-        # collection when many files are attached. Querying individual file IDs
-        # instead works correctly, so we fetch the KB's file_ids and pass them
-        # as per-file references in the chat completions payload.
-        self._kb_file_ids: Optional[List[str]] = None
-        self._kb_file_ids_fetched_at: float = 0.0
 
     def _headers(self) -> Dict[str, str]:
         return {
@@ -101,33 +240,114 @@ class OpenWebUIClient:
         self._kb_name = name
         return name
 
-    async def _get_kb_file_ids(self) -> List[str]:
-        """Fetch (with short TTL cache) the file IDs in the scoped knowledge base.
-
-        Open WebUI v0.6.34 collection-level retrieval does not reliably search
-        all files when many are attached to a single KB. Querying individual
-        file IDs works correctly, so we resolve the list and pass each as a
-        per-file reference in the chat completions payload. The list is cached
-        for 60 seconds so newly ingested files are picked up without a restart.
-        """
-        if self._kb_file_ids is not None and (time.monotonic() - self._kb_file_ids_fetched_at) < 60:
-            return self._kb_file_ids
-        kb_id = self._settings.openwebui_kb_id
-        file_ids: List[str] = []
+    async def _query_collection_once(
+        self, client: httpx.AsyncClient, kb_id: str, query: str, k: int
+    ) -> List[Tuple[str, str, float]]:
+        """Run one collection vector query. Returns [(file_id, name, rank_score)]."""
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.get(
-                    f"{self._base}/api/v1/knowledge/{kb_id}",
-                    headers=self._headers(),
-                )
-            if resp.status_code < 400:
-                data = resp.json()
-                if isinstance(data, dict):
-                    file_ids = data.get("data", {}).get("file_ids", []) or []
-        except Exception as e:
-            logger.warning("KB file_ids lookup failed: %s", e)
-        self._kb_file_ids = file_ids
-        self._kb_file_ids_fetched_at = time.monotonic()
+            resp = await client.post(
+                f"{self._base}/api/v1/retrieval/query/collection",
+                headers=self._headers(),
+                json={
+                    "collection_names": [kb_id],
+                    "query": query,
+                    "k": k,
+                },
+            )
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            logger.warning("Collection pre-query transport error: %s", e)
+            return []
+
+        if resp.status_code >= 400:
+            logger.warning(
+                "Collection pre-query failed with status %s", resp.status_code
+            )
+            return []
+
+        data = resp.json() if resp.content else {}
+        metadatas = data.get("metadatas") or []
+        distances = data.get("distances") or []
+        flat_meta: List[Dict[str, Any]] = []
+        flat_dist: List[float] = []
+        for group in metadatas:
+            if isinstance(group, list):
+                flat_meta.extend(m for m in group if isinstance(m, dict))
+            elif isinstance(group, dict):
+                flat_meta.append(group)
+        for group in distances:
+            if isinstance(group, list):
+                flat_dist.extend(float(x) for x in group if isinstance(x, (int, float)))
+            elif isinstance(group, (int, float)):
+                flat_dist.append(float(group))
+
+        # Ignore raw distances: Open WebUI may return similarity or distance
+        # depending on hybrid vs vector mode. Rank position is stable.
+        _ = flat_dist
+        hits: List[Tuple[str, str, float]] = []
+        for i, meta in enumerate(flat_meta):
+            fid = meta.get("file_id") or meta.get("id")
+            name = str(meta.get("name") or "")
+            if not isinstance(fid, str) or not fid:
+                continue
+            hits.append((fid, name, 1.0 / (1.0 + i)))
+        return hits
+
+    async def _query_relevant_file_ids(self, query: str) -> List[str]:
+        """Pre-retrieve relevant file IDs via multi-query collection search.
+
+        Open WebUI v0.6.34's chat-completions path with ``type: collection``
+        returns irrelevant chunks even when the retrieval API can find the
+        right statutes. We therefore:
+          1. rewrite the user question into complementary retrieval strings
+             (original + acronym-expanded + keyword distill),
+          2. query the KB collection with each,
+          3. merge/rank unique file IDs and pass the top set into chat as
+             ``type: file`` references (generation works; all-files hangs).
+        """
+        kb_id = self._settings.openwebui_kb_id
+        queries = _retrieval_queries(query)
+        if not queries:
+            return []
+
+        # Per-query k a bit above the final cap so merges have headroom.
+        per_k = max(_RAG_FILE_CAP, 8)
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            results = await asyncio.gather(
+                *[
+                    self._query_collection_once(client, kb_id, rq, per_k)
+                    for rq in queries
+                ]
+            )
+
+        # Aggregate: sum rank scores; bonus when filename matches query tokens.
+        q_tokens = {t.lower() for t in re.findall(r"[A-Za-z0-9]+", query) if len(t) > 2}
+        for acr, full in _ACRONYM_EXPANSIONS.items():
+            if acr.lower() in q_tokens or any(
+                w.lower() in q_tokens for w in full.split() if len(w) > 3
+            ):
+                q_tokens.add(acr.lower())
+                q_tokens.update(w.lower() for w in full.split() if len(w) > 2)
+
+        scores: Dict[str, float] = {}
+        names: Dict[str, str] = {}
+        for hits in results:
+            for fid, name, rank_score in hits:
+                scores[fid] = scores.get(fid, 0.0) + rank_score
+                names[fid] = name or names.get(fid, "")
+                name_l = name.lower()
+                # Filename boost: "ibc_act_01.md" should win for IBC questions.
+                if any(tok in name_l for tok in q_tokens if len(tok) >= 3):
+                    scores[fid] += 0.75
+
+        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+        file_ids = [fid for fid, _ in ranked[:_RAG_FILE_CAP]]
+        if file_ids:
+            logger.info(
+                "RAG multi-query (%d variants) selected %d file(s): %s",
+                len(queries),
+                len(file_ids),
+                [names.get(f, f[:8]) for f in file_ids[:6]],
+            )
         return file_ids
 
     async def chat_completion(
@@ -155,12 +375,24 @@ class OpenWebUIClient:
         if temperature is not None:
             payload["temperature"] = temperature
         if use_rag:
-            file_ids = await self._get_kb_file_ids()
+            # Two-step RAG: collection vector search (accurate) → pass only the
+            # top file IDs into chat completions (generation works for files,
+            # but is broken for type:collection on this Open WebUI version).
+            # Falls back to collection if the pre-query returns nothing.
+            file_ids = await self._query_relevant_file_ids(query)
             if file_ids:
                 payload["files"] = [
                     {"type": "file", "id": fid} for fid in file_ids
                 ]
+                logger.info(
+                    "RAG pre-query selected %d file(s) for chat completions",
+                    len(file_ids),
+                )
             else:
+                logger.warning(
+                    "RAG pre-query returned no file_ids — falling back to "
+                    "collection reference"
+                )
                 payload["files"] = [
                     {"type": "collection", "id": self._settings.openwebui_kb_id}
                 ]
