@@ -134,11 +134,12 @@ def _retrieval_queries(query: str) -> List[str]:
 
     out: List[str] = [q]
 
-    # Acronym expansion: replace whole-word acronyms (case-insensitive).
+    # Acronym expansion: case-sensitive whole-word match so English words like
+    # "smart" do not expand via the SMART fund entry.
     expanded = q
     for acr, full in _ACRONYM_EXPANSIONS.items():
-        expanded = re.sub(rf"\b{re.escape(acr)}\b", f"{acr} {full}", expanded, flags=re.IGNORECASE)
-    if expanded.lower() != q.lower():
+        expanded = re.sub(rf"\b{re.escape(acr)}\b", f"{acr} {full}", expanded)
+    if expanded != q:
         out.append(expanded)
 
     # Keyword distill: keep content tokens + any matched expansions.
@@ -152,9 +153,9 @@ def _retrieval_queries(query: str) -> List[str]:
         if low not in seen_kw:
             seen_kw.add(low)
             keywords.append(tok)
-        upper = tok.upper()
-        if upper in _ACRONYM_EXPANSIONS:
-            full = _ACRONYM_EXPANSIONS[upper]
+        # Case-exact acronym match (same rule as expansion) so "smart" ≠ SMART.
+        if tok in _ACRONYM_EXPANSIONS:
+            full = _ACRONYM_EXPANSIONS[tok]
             if full.lower() not in seen_kw:
                 seen_kw.add(full.lower())
                 keywords.append(full)
@@ -319,25 +320,42 @@ class OpenWebUIClient:
                 ]
             )
 
-        # Aggregate: sum rank scores; bonus when filename matches query tokens.
-        q_tokens = {t.lower() for t in re.findall(r"[A-Za-z0-9]+", query) if len(t) > 2}
+        # Aggregate: sum rank scores; bonus once per file when filename tokens
+        # intersect query tokens (stopwords stripped; no loose substring match).
+        q_tokens = {
+            t.lower()
+            for t in re.findall(r"[A-Za-z0-9]+", query)
+            if len(t) > 2 and t.lower() not in _STOPWORDS
+        }
         for acr, full in _ACRONYM_EXPANSIONS.items():
             if acr.lower() in q_tokens or any(
                 w.lower() in q_tokens for w in full.split() if len(w) > 3
             ):
                 q_tokens.add(acr.lower())
-                q_tokens.update(w.lower() for w in full.split() if len(w) > 2)
+                q_tokens.update(
+                    w.lower()
+                    for w in full.split()
+                    if len(w) > 2 and w.lower() not in _STOPWORDS
+                )
 
         scores: Dict[str, float] = {}
         names: Dict[str, str] = {}
+        boosted: set[str] = set()
         for hits in results:
             for fid, name, rank_score in hits:
                 scores[fid] = scores.get(fid, 0.0) + rank_score
                 names[fid] = name or names.get(fid, "")
-                name_l = name.lower()
-                # Filename boost: "ibc_act_01.md" should win for IBC questions.
-                if any(tok in name_l for tok in q_tokens if len(tok) >= 3):
+                if fid in boosted:
+                    continue
+                # Filename tokens: ibc_act_01.md -> {ibc, act, 01, md}
+                name_tokens = {
+                    t.lower()
+                    for t in re.findall(r"[A-Za-z0-9]+", name)
+                    if len(t) >= 3 and t.lower() not in _STOPWORDS
+                }
+                if q_tokens & name_tokens:
                     scores[fid] += 0.75
+                    boosted.add(fid)
 
         ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
         file_ids = [fid for fid, _ in ranked[:_RAG_FILE_CAP]]
@@ -375,27 +393,23 @@ class OpenWebUIClient:
         if temperature is not None:
             payload["temperature"] = temperature
         if use_rag:
-            # Two-step RAG: collection vector search (accurate) → pass only the
-            # top file IDs into chat completions (generation works for files,
-            # but is broken for type:collection on this Open WebUI version).
-            # Falls back to collection if the pre-query returns nothing.
+            # Two-step RAG: collection vector search → pass only the top file
+            # IDs into chat completions. type:collection chat is broken on this
+            # Open WebUI version (irrelevant chunks), so an empty pre-query
+            # fails closed instead of falling back.
             file_ids = await self._query_relevant_file_ids(query)
-            if file_ids:
-                payload["files"] = [
-                    {"type": "file", "id": fid} for fid in file_ids
-                ]
-                logger.info(
-                    "RAG pre-query selected %d file(s) for chat completions",
-                    len(file_ids),
+            if not file_ids:
+                raise OpenWebUIError(
+                    "rag_unavailable",
+                    "Knowledge base retrieval returned no matching documents",
                 )
-            else:
-                logger.warning(
-                    "RAG pre-query returned no file_ids — falling back to "
-                    "collection reference"
-                )
-                payload["files"] = [
-                    {"type": "collection", "id": self._settings.openwebui_kb_id}
-                ]
+            payload["files"] = [
+                {"type": "file", "id": fid} for fid in file_ids
+            ]
+            logger.info(
+                "RAG pre-query selected %d file(s) for chat completions",
+                len(file_ids),
+            )
 
         last_exc: Optional[OpenWebUIError] = None
         for attempt in (1, 2):
