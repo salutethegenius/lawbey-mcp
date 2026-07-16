@@ -34,11 +34,9 @@ class Settings(BaseSettings):
     # given retrieval (the retrieval itself is non-deterministic; see retries).
     openwebui_temperature: float = 0.0
 
-    # RAG retrieval on the upstream instance is bimodal/non-deterministic
-    # (some requests retrieve the relevant chunks, others retrieve unrelated
-    # ones). Retry on a decline up to this many total attempts so a grounded
-    # answer is almost always returned. P(grounded) = 1 - (1-p)^n.
-    rag_max_attempts: int = 3
+    # Decline retries. Multi-query pre-retrieve is largely deterministic, so
+    # more than two attempts rarely changes the file set and just adds latency.
+    rag_max_attempts: int = 2
 
     # Partner authentication. Format: "name:secret,name:secret".
     partner_api_keys: str = ""

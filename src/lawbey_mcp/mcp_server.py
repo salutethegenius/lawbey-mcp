@@ -119,12 +119,9 @@ async def run_legal_query(
     # produces well-cited answers and naturally declines off-topic questions
     # (e.g. US corporate tax) when the retrieved context is irrelevant.
     #
-    # Upstream RAG retrieval is non-deterministic/bimodal: a given request may
-    # retrieve the relevant chunks OR unrelated ones. When it retrieves the
-    # wrong chunks the model declines ("context does not contain..."). We retry
-    # on such declines (independent retrieval each attempt) so a grounded
-    # answer is almost always returned. temperature=0 makes the answer for a
-    # given retrieval deterministic.
+    # When the model declines ("context does not contain..."), retry once.
+    # Multi-query file selection is largely deterministic, so further attempts
+    # rarely help. temperature=0 keeps the answer stable for a given retrieval.
     max_attempts = max(1, settings.rag_max_attempts)
     result: Dict[str, Any] = {}
     for attempt in range(1, max_attempts + 1):
@@ -141,22 +138,19 @@ async def run_legal_query(
             return _error(e.kind, e.message)
 
         answer = result["answer"]
-        sources = result["sources"]
         is_decline = bool(_DECLINE_RE.search(answer))
 
-        # Only retry when RAG is on AND the model declined (wrong chunks
-        # retrieved). Off-topic / non-RAG / real answers are returned as-is.
+        # Only retry when RAG is on AND the model declined. Off-topic / non-RAG
+        # / real answers are returned as-is.
         if not is_decline or not use_rag or attempt >= max_attempts:
             break
         logger.info(
-            "RAG decline on attempt %d/%d — retrying (upstream retrieval "
-            "non-determinism)",
+            "RAG decline on attempt %d/%d — retrying",
             attempt,
             max_attempts,
         )
-        last_result = result
 
-    answer: str = result["answer"]
+    answer = result["answer"]
     sources: List[Dict[str, Any]] = result["sources"]
 
     grounded = any(bool(s.get("chunks")) for s in sources)
